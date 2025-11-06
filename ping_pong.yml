@@ -1,0 +1,6 @@
+- name: Simple ping/pong to Ubuntu host
+  hosts: azure-ubuntu-poc
+  gather_facts: false
+  tasks:
+    - name: Ansible ping
+      ansible.builtin.ping:

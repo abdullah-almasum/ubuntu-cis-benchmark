@@ -1,0 +1,103 @@
+---
+- name: Ubuntu OS patching, reboot-if-needed, and verification
+  hosts: ansible-poc-linux
+  become: true
+  gather_facts: true
+
+  vars:
+    apt_env:
+      DEBIAN_FRONTEND: noninteractive
+
+  tasks:
+    - name: Ensure target is Debian/Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "Debian"
+        fail_msg: "This playbook is intended for Debian/Ubuntu systems only."
+
+    # --- Pre-check: pending updates (visibility before patching)
+    - name: List pending upgrades (pre-check)   # CHANGED: use apt-get -s instead of 'apt list' + pipefail
+      ansible.builtin.shell: |
+        apt-get -s dist-upgrade | awk '/^Inst /{print $2,$3,$4}'
+      register: pre_upgradable
+      changed_when: false
+      failed_when: false                       # CHANGED: never fail this visibility task
+
+    - name: Show pending upgrades (pre-check)
+      ansible.builtin.debug:
+        msg: >-
+          Pending packages BEFORE update:
+          {{ (pre_upgradable.stdout_lines | length) | ternary(pre_upgradable.stdout_lines, ['<none>']) }}
+
+    # --- Update & Upgrade (equivalent to: apt update && apt -y full-upgrade && apt -y autoremove && apt clean)
+    - name: apt update
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      environment: "{{ apt_env }}"
+
+    - name: apt full-upgrade (dist-upgrade)
+      ansible.builtin.apt:
+        upgrade: dist
+      register: upgrade_result
+      environment: "{{ apt_env }}"
+
+    - name: apt autoremove
+      ansible.builtin.apt:
+        autoremove: yes
+      environment: "{{ apt_env }}"
+
+    - name: apt clean
+      ansible.builtin.apt:
+        clean: yes
+      environment: "{{ apt_env }}"
+
+    # --- Reboot if required file exists OR upgrade changed anything
+    - name: Check if reboot is required (Ubuntu)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Reboot if required or if upgrade changed packages
+      ansible.builtin.reboot:
+        msg: "Rebooting after upgrades"
+        connect_timeout: 10
+        reboot_timeout: 900
+        test_command: whoami
+      when: reboot_flag.stat.exists or upgrade_result.changed
+
+    - name: Wait for SSH after reboot (only when rebooted)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: 22
+        timeout: 300
+        state: started
+      when: reboot_flag.stat.exists or upgrade_result.changed
+
+    # --- Post-checks: confirm fully updated
+    - name: Kernel version
+      ansible.builtin.command: uname -r
+      register: kernel_out
+      changed_when: false
+
+    - name: OS release details
+      ansible.builtin.shell: cat /etc/os-release
+      register: os_release
+      changed_when: false
+
+    - name: List pending upgrades (post-check)   # CHANGED: use apt-get -s instead of 'apt list' + pipefail
+      ansible.builtin.shell: |
+        apt-get -s dist-upgrade | awk '/^Inst /{print $2,$3,$4}'
+      register: post_upgradable
+      changed_when: false
+      failed_when: false                        # CHANGED: never fail this visibility task
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ ansible_facts['nodename'] }} ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }})"
+          - "Kernel (uname -r): {{ kernel_out.stdout }}"
+          - "Reboot required file existed: {{ reboot_flag.stat.exists | default(false) }}"
+          - "Packages changed by upgrade: {{ upgrade_result.changed | default(false) }}"
+          - "Pending packages AFTER update: {{ (post_upgradable.stdout_lines | length) | ternary(post_upgradable.stdout_lines, ['<none>']) }}"
+          - "OS Release (short): {{ (os_release.stdout_lines | select('search','^PRETTY_NAME=') | list | first | default('PRETTY_NAME=?')) }}"
